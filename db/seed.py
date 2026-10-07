@@ -543,9 +543,15 @@ CHECKS: list[tuple[str, str, str]] = [
     ),
     (
         "⑩ 明细金额 / 实付金额 比值",
-        "SELECT ROUND((SELECT SUM(item_amount) FROM order_items) "
-        "/ (SELECT SUM(pay_amount) FROM orders), 4)",
-        "期望 ≠ 1，说明 item_amount 加总失真",
+        # 注意：分子分母必须都排除 cancelled，否则两边口径不一致，
+        # 算出来的差异里混进"取消单"这一项，反而低估了纯口径差。
+        "SELECT ROUND("
+        "(SELECT SUM(oi.item_amount) FROM order_items oi "
+        " JOIN orders o ON o.order_id = oi.order_id "
+        " WHERE o.order_status <> 'cancelled') "
+        "/ NULLIF((SELECT SUM(pay_amount) FROM orders "
+        " WHERE order_status <> 'cancelled'), 0), 4)",
+        "期望 ≠ 1，说明两个口径的销售额确实不同",
     ),
     (
         "⑪ 退货率（按订单，仅 approved）",

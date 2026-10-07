@@ -391,7 +391,7 @@ cases:
   note: >
     陷阱⑪的核心：必须 LEFT JOIN refunds，把"没有退款的订单"保留在分母里，
     否则算出来的是"退款订单中有多少是退货"而不是"退货率"。
-    服装的退货率应当显著高于食品（数据集里分别约 18% 与 4%），
+    服装的退货率应当显著高于食品（本数据集实测 16.42% vs 7.00%，相差 2.3 倍），
     这个差距本身就是检验答案是否可信的合理性信号。
 
 - id: Q019
@@ -433,15 +433,27 @@ cases:
   difficulty: hard
   question: 我们想对一下账：把所有商品明细的金额加起来，相当于订单实付总额的多少倍？
   gold_sql: |
-    SELECT (SELECT SUM(item_amount) FROM order_items)::numeric
-           / NULLIF((SELECT SUM(pay_amount) FROM orders WHERE order_status <> 'cancelled'), 0) AS ratio;
+    SELECT (SELECT SUM(oi.item_amount)
+            FROM order_items oi
+            JOIN orders o ON o.order_id = oi.order_id
+            WHERE o.order_status <> 'cancelled')::numeric
+           / NULLIF((SELECT SUM(pay_amount)
+                     FROM orders WHERE order_status <> 'cancelled'), 0) AS ratio;
   check: approx
   tolerance: 0.05
   traps: [6, 10]
   note: >
     陷阱⑩ —— 整套评测集里唯一一条直接量化"两个口径差多少"的题。
     明细加总（item_amount）按吊牌价累计，实付（pay_amount）是扣掉优惠、
-    积分抵扣又加上运费之后的钱，两者必然不等（本数据集里比值约 1.18）。
-    这条题的价值在于：它把"销售额到底指什么"从一个抽象争论，
-    变成了一个可以印在报表上的具体倍数。
-    如果系统对这类题不做任何口径声明就直接给一个数，说明语义层还没建起来。
+    积分抵扣又加上运费之后的钱，两者必然不等（本数据集实测 1.0357，
+    即按明细口径算会把销售额算高 3.57%）。
+
+    ★ 这条题的 gold_sql 本身踩过一次口径坑，值得记下来：
+      初版分子写的是 `(SELECT SUM(item_amount) FROM order_items)` ——
+      没有 JOIN 回订单表排除取消单，而分母排除了。
+      一边含取消单、一边不含，算出来是 1.1762，把"取消单的影响"
+      混进了"纯口径差"里。修正后才得到 1.0357。
+
+      这正是本项目要解决的问题在**评测集自身**上的重演：
+      口径不一致的 SQL 不会报错，它只会安静地给出一个无法解释的数。
+      也说明 gold_sql 也需要被审查 —— 标准答案错了，整条评测链就都错了。
