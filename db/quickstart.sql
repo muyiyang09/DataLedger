@@ -13,6 +13,29 @@
 
 
 -- -----------------------------------------------------------------------------
+-- 0. 看表结构 + 我在 schema.sql 里埋的「口径陷阱注释」
+--    pgAdmin 里看字段有三条路：
+--      a) 左侧树展开 表 → 具体表 → 列            （只给列名和类型）
+--      b) 右键表 → 属性 → 列                     （同上，更详细些）
+--      c) 下面这条 SQL                           （唯一能一次看全字段注释的）
+--    强烈建议用 c —— db/schema.sql 里每个陷阱的说明都写在字段注释里，
+--    那些注释是理解这个数据集的关键。
+-- -----------------------------------------------------------------------------
+SELECT
+    c.table_name,
+    c.ordinal_position                              AS pos,
+    c.column_name,
+    c.data_type,
+    col_description(format('%I.%I', c.table_schema, c.table_name)::regclass,
+                    c.ordinal_position)              AS comment
+FROM information_schema.columns c
+WHERE c.table_schema = 'public'
+  AND c.table_name IN ('dim_region', 'dim_product', 'dim_customer',
+                       'orders', 'order_items', 'refunds')
+ORDER BY c.table_name, c.ordinal_position;
+
+
+-- -----------------------------------------------------------------------------
 -- 1. 数据集规模：确认 6 张表都有数据
 -- -----------------------------------------------------------------------------
 SELECT 'dim_region'  AS table_name, COUNT(*) AS rows FROM dim_region
