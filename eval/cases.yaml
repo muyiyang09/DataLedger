@@ -1,0 +1,447 @@
+# =============================================================================
+# DataLedger · 评测用例集
+# =============================================================================
+#
+# 【为什么先写这个文件，而不是先写业务代码】
+#
+# 智能问数项目最容易烂尾的方式是：先接大模型、先做界面、先跑通 demo，
+# 然后永远回答不出"你的准确率是多少"。
+#
+# 所以这里把顺序倒过来：先把"什么算对"定义下来，再写代码去够它。
+# 每条用例都带 gold_sql，评测方式是**执行两条 SQL 对比结果集**，
+# 而不是对比 SQL 字符串 —— 因为同一个问题可以有很多种正确写法。
+#
+# 【字段说明】
+#   id          用例编号
+#   category    单表聚合 / 多表连接 / 时间范围 / 排行 TopN / 比率统计
+#   difficulty  easy 为基础问法，hard 为需要多步推理或口径判断
+#   question    给系统的自然语言问句（尽量口语化，别写成 SQL 的中文翻译）
+#   gold_sql    标准答案 SQL，保证可执行
+#   check       结果比对方式
+#                 exact         单值精确相等
+#                 approx        单值近似相等（见 tolerance，相对误差）
+#                 unordered_set 结果集无序比对（用于排行类）
+#   tolerance   approx 的相对误差上限
+#   traps       这条用例踩中的 schema.sql 口径陷阱编号，空表示无陷阱
+#   note        为什么这条题会出错 —— 这才是评测集真正的价值
+#
+# 【设计约束】
+#   1. 至少 30 条用例必须踩中 12 个陷阱之一（当前 21 条已覆盖全部 12 个陷阱）
+#   2. gold_sql 必须排除已取消订单（除非题目本身在考这一点）
+#   3. 问句不能直接出现字段名（否则退化成翻译题）
+# =============================================================================
+
+meta:
+  version: "0.1"
+  total_planned: 300
+  total_written: 21
+  dataset_seed: 20261007
+  # 结果比对由 eval/run_eval.py 执行：
+  #   模型 SQL 与 gold_sql 在同一事务快照下各跑一次，比对结果集。
+
+cases:
+
+# -----------------------------------------------------------------------------
+# A. 单表聚合（4 条）
+# -----------------------------------------------------------------------------
+- id: Q001
+  category: 单表聚合
+  difficulty: easy
+  question: 到目前为止一共有多少笔有效订单？
+  gold_sql: |
+    SELECT COUNT(*) AS valid_orders
+    FROM orders
+    WHERE order_status <> 'cancelled';
+  check: exact
+  traps: [6]
+  note: >
+    陷阱⑥。数据集里约 12% 的订单是 cancelled，若直接 COUNT(*) 会多算一万多笔。
+    "有效"二字是这题的判据 —— 它把"要不要排除取消单"这个问题显式化了。
+
+- id: Q002
+  category: 单表聚合
+  difficulty: easy
+  question: 有效订单的实付金额总和是多少？
+  gold_sql: |
+    SELECT SUM(pay_amount) AS gmv
+    FROM orders
+    WHERE order_status <> 'cancelled';
+  check: approx
+  tolerance: 0.001
+  traps: [6, 7]
+  note: >
+    陷阱⑥⑦。两个坑叠在一起：既要排除取消单，又要选对金额字段。
+    用 total_amount - discount_amount 也是一种"看起来合理"的写法，但答案是错的。
+
+- id: Q003
+  category: 单表聚合
+  difficulty: medium
+  question: 历史累计一共卖出了多少件商品？
+  gold_sql: |
+    SELECT SUM(oi.quantity) AS total_units
+    FROM order_items oi
+    JOIN orders o ON o.order_id = oi.order_id
+    WHERE o.order_status <> 'cancelled';
+  check: approx
+  tolerance: 0.001
+  traps: [6, 9]
+  note: >
+    陷阱⑨。"卖了多少件"里的"件"是 SUM(quantity)，不是 COUNT(*) 也不是订单数。
+    同一句话在业务口语里同时对应三种口径，这题专门考能不能选中正确的那一种。
+    另外必须 JOIN 回订单表才能排除取消单 —— 明细表本身没有状态字段。
+
+- id: Q004
+  category: 单表聚合
+  difficulty: easy
+  question: 华东一共覆盖了多少个城市？
+  gold_sql: |
+    SELECT COUNT(DISTINCT city) AS city_count
+    FROM dim_region
+    WHERE region_group = '华东区';
+  check: exact
+  traps: [1]
+  note: >
+    陷阱①。库里存的是「华东区」，用户说「华东」。
+    写 `region_group = '华东'` 会返回 0 行 —— 而且不报错，只是安静地给一个 0。
+    这正是需要语义层做"同义词归一"的地方。
+
+# -----------------------------------------------------------------------------
+# B. 多表连接（4 条）
+# -----------------------------------------------------------------------------
+- id: Q005
+  category: 多表连接
+  difficulty: hard
+  question: 服装类目的整体毛利率是多少？
+  gold_sql: |
+    SELECT (SUM(oi.item_amount) - SUM(oi.quantity * p.cost_price)) / SUM(oi.item_amount) AS gross_margin
+    FROM order_items oi
+    JOIN dim_product p ON p.product_id = oi.product_id
+    JOIN orders o ON o.order_id = oi.order_id
+    WHERE p.category_l1 = '服装'
+      AND o.order_status <> 'cancelled';
+  check: approx
+  tolerance: 0.01
+  traps: [2, 3, 6]
+  note: >
+    陷阱②③⑥。三个坑同时踩：
+    ② 服装是一级类目，写 category_l1 而不是 category_l2；
+    ③ 成本价只在商品表，订单侧不 JOIN 就根本算不出毛利（这是"跨表口径"）；
+    ⑥ 要排除取消单。
+    只算收入不算成本、或算成本时漏 JOIN，都能跑通，但答案错。
+
+- id: Q006
+  category: 多表连接
+  difficulty: medium
+  question: 广东省的用户一共贡献了多少销售额？（按收货地统计）
+  gold_sql: |
+    SELECT SUM(o.pay_amount) AS gmv
+    FROM orders o
+    JOIN dim_region r ON r.region_id = o.region_id
+    WHERE r.province = '广东省'
+      AND o.order_status <> 'cancelled';
+  check: approx
+  tolerance: 0.001
+  traps: [5, 6]
+  note: >
+    陷阱⑤⑥。"广东的用户"有两种理解：注册地在广东的用户下单（join dim_customer），
+    或者收货地在广东的订单（join orders.region_id）。
+    两者答案差约 15%。题目里的"按收货地"是判据；去掉这句，它就是一个必须反问的题。
+
+- id: Q007
+  category: 多表连接
+  difficulty: medium
+  question: 男装一共卖出去了多少件？
+  gold_sql: |
+    SELECT SUM(oi.quantity) AS units
+    FROM order_items oi
+    JOIN dim_product p ON p.product_id = oi.product_id
+    JOIN orders o ON o.order_id = oi.order_id
+    WHERE p.category_l2 = '男装'
+      AND o.order_status <> 'cancelled';
+  check: approx
+  tolerance: 0.001
+  traps: [2, 6, 9]
+  note: >
+    陷阱②。男装是二级类目。如果模型写 category_l1 = '男装'，
+    SQL 照样执行成功，只是命中 0 行 —— 典型的静默错误。
+    这类错误在真实项目里最难被发现，因为没有任何异常信号。
+
+- id: Q008
+  category: 多表连接
+  difficulty: medium
+  question: 30 岁以上的用户有多少人？
+  gold_sql: |
+    SELECT COUNT(*) AS user_count
+    FROM dim_customer
+    WHERE birth_date IS NOT NULL
+      AND birth_date <= CURRENT_DATE - INTERVAL '30 years';
+  check: approx
+  tolerance: 0.02
+  traps: [4]
+  note: >
+    陷阱④。库里只有出生日期，没有年龄字段。
+    正确做法是换算成日期比较；直接写 `age > 30` 会报错（好错），
+    而漏掉 `birth_date IS NOT NULL` 则会算错（坏错）—— 约 3% 的用户没有生日记录。
+
+# -----------------------------------------------------------------------------
+# C. 时间范围（4 条）
+# -----------------------------------------------------------------------------
+- id: Q009
+  category: 时间范围
+  difficulty: medium
+  question: 2026 年 3 月 1 日这一天有多少笔订单？
+  gold_sql: |
+    SELECT COUNT(*) AS orders_on_day
+    FROM orders
+    WHERE order_time >= DATE '2026-03-01'
+      AND order_time < DATE '2026-03-02'
+      AND order_status <> 'cancelled';
+  check: approx
+  tolerance: 0.05
+  traps: [6, 8]
+  note: >
+    陷阱⑧。order_time 是带时分秒的 TIMESTAMP。
+    写 `order_time = '2026-03-01'` 会被隐式转成当天 00:00:00，
+    只命中恰好零点那一秒下单的订单 —— 在这份数据集里通常是 0 条。
+    "日期 vs 时间戳"是最经典、最难自查的一类错误。
+
+- id: Q010
+  category: 时间范围
+  difficulty: medium
+  question: 2026 年 6 月的销售额是多少？
+  gold_sql: |
+    SELECT SUM(pay_amount) AS gmv
+    FROM orders
+    WHERE order_time >= DATE '2026-06-01'
+      AND order_time < DATE '2026-07-01'
+      AND order_status <> 'cancelled';
+  check: approx
+  tolerance: 0.001
+  traps: [6, 7, 8]
+  note: >
+    陷阱⑥⑦⑧。左闭右开区间是标准写法，用 BETWEEN 也能对，
+    但用 `<= DATE '2026-06-30'` 会漏掉 6 月 30 日当天带时分秒的订单。
+
+- id: Q011
+  category: 时间范围
+  difficulty: medium
+  question: 最近 7 天有多少笔订单？
+  gold_sql: |
+    SELECT COUNT(*) AS recent_orders
+    FROM orders
+    WHERE order_time >= CURRENT_DATE - INTERVAL '7 days'
+      AND order_status <> 'cancelled';
+  check: approx
+  tolerance: 0.05
+  traps: [6, 8]
+  note: >
+    陷阱⑧的变体。"最近 7 天"含不含今天、算不算自然日，本身就是需要澄清的。
+    这题用于验证系统在时间口径模糊时**会不会主动声明假设**，而不只是给个数。
+
+- id: Q012
+  category: 时间范围
+  difficulty: hard
+  question: 双 11 当天（11 月 11 日）的订单量比当月日均高出多少倍？
+  gold_sql: |
+    WITH nov AS (
+      SELECT DATE(order_time) AS d, COUNT(*) AS cnt
+      FROM orders
+      WHERE order_time >= DATE '2025-11-01'
+        AND order_time < DATE '2025-12-01'
+        AND order_status <> 'cancelled'
+      GROUP BY 1
+    )
+    SELECT
+      MAX(cnt) FILTER (WHERE d = DATE '2025-11-11')::numeric
+        / (SUM(cnt)::numeric / COUNT(*)) AS peak_ratio
+    FROM nov;
+  check: approx
+  tolerance: 0.10
+  traps: [6, 8]
+  note: >
+    需要把"日均"的口径定死（当月所有自然日，还是当月有订单的日？），
+    并且双 11 当天要单独取值。这题故意留出多解空间，
+    评测时按相对误差放宽 —— 目的是看系统能不能给出一个数量级正确的答案。
+
+# -----------------------------------------------------------------------------
+# D. 排行 TopN（4 条）
+# -----------------------------------------------------------------------------
+- id: Q013
+  category: 排行 TopN
+  difficulty: medium
+  question: 卖得最多的 5 个一级类目是哪些？
+  gold_sql: |
+    SELECT p.category_l1, SUM(oi.quantity) AS units
+    FROM order_items oi
+    JOIN dim_product p ON p.product_id = oi.product_id
+    JOIN orders o ON o.order_id = oi.order_id
+    WHERE o.order_status <> 'cancelled'
+    GROUP BY p.category_l1
+    ORDER BY units DESC
+    LIMIT 5;
+  check: unordered_set
+  traps: [2, 6, 9]
+  note: >
+    陷阱②⑥⑨。"卖得最多"要先澄清是件数还是金额（这里按件数），
+    再者必须限定在一级类目上分组。类目只有 5 个，LIMIT 5 必然返回全部，
+    这题实际考的是"分组维度选对没有"。
+
+- id: Q014
+  category: 排行 TopN
+  difficulty: medium
+  question: 销售额最高的 5 个省份是哪几个？
+  gold_sql: |
+    SELECT r.province, SUM(o.pay_amount) AS gmv
+    FROM orders o
+    JOIN dim_region r ON r.region_id = o.region_id
+    WHERE o.order_status <> 'cancelled'
+    GROUP BY r.province
+    ORDER BY gmv DESC
+    LIMIT 5;
+  check: unordered_set
+  traps: [5, 6, 7]
+  note: >
+    陷阱⑤⑥⑦。这里的 region_id 是收货地（订单表的），不是用户注册地。
+    选错 JOIN 目标，省份排名会变 —— 而且变化很微妙，前几名可能还是对的，
+    所以只看 Top 3 看不出问题，必须比对完整结果集。
+
+- id: Q015
+  category: 排行 TopN
+  difficulty: hard
+  question: 销售额超过 10 万的商品里，毛利率最高的 5 个是哪些？
+  gold_sql: |
+    SELECT p.product_name,
+           SUM(oi.item_amount) AS revenue,
+           (SUM(oi.item_amount) - SUM(oi.quantity * p.cost_price)) / NULLIF(SUM(oi.item_amount), 0) AS gross_margin
+    FROM order_items oi
+    JOIN dim_product p ON p.product_id = oi.product_id
+    JOIN orders o ON o.order_id = oi.order_id
+    WHERE o.order_status <> 'cancelled'
+    GROUP BY p.product_id, p.product_name
+    HAVING SUM(oi.item_amount) > 100000
+    ORDER BY gross_margin DESC
+    LIMIT 5;
+  check: unordered_set
+  traps: [3, 6]
+  note: >
+    陷阱③⑥。这题有两个"先筛后算"的顺序问题：
+    销售额先聚合再过滤（HAVING 不是 WHERE），
+    以及毛利率必须在同一个 GROUP BY 里算出来（不能先算收入再回头 join）。
+
+- id: Q016
+  category: 排行 TopN
+  difficulty: easy
+  question: 用户数量最多的 5 个大区是哪些？
+  gold_sql: |
+    SELECT r.region_group, COUNT(*) AS user_count
+    FROM dim_customer c
+    JOIN dim_region r ON r.region_id = c.region_id
+    GROUP BY r.region_group
+    ORDER BY user_count DESC
+    LIMIT 5;
+  check: unordered_set
+  traps: []
+  note: >
+    对照组。这条不踩任何陷阱，用于确认评测框架本身不会把所有题都判错。
+    答案是「华东区」排第一（权重 35%，且省份数最多）。
+
+# -----------------------------------------------------------------------------
+# E. 比率统计（4 条）
+# -----------------------------------------------------------------------------
+- id: Q017
+  category: 比率统计
+  difficulty: hard
+  question: 整体退货率是多少？
+  gold_sql: |
+    SELECT COUNT(DISTINCT r.order_id)::numeric
+           / NULLIF((SELECT COUNT(*) FROM orders WHERE order_status <> 'cancelled'), 0) AS refund_rate
+    FROM refunds r
+    WHERE r.refund_status = 'approved';
+  check: approx
+  tolerance: 0.02
+  traps: [11, 12]
+  note: >
+    陷阱⑪⑫。这题的"错法"极其多：
+      分子要不要只算 approved？（要 —— pending/rejected 占 30%）
+      分子用 COUNT(*) 还是 COUNT(DISTINCT order_id)？（要 distinct，一个订单可能多行退款）
+      分母要不要排除 cancelled？（要）
+      分母是订单数、明细行数还是金额？（三种都能自圆其说，必须定义）
+    而且用 JOIN 代替子查询时，整单退（item_id IS NULL）会被静默丢掉。
+    这题基本是整套评测里信息量最大的一条。
+
+- id: Q018
+  category: 比率统计
+  difficulty: hard
+  question: 服装和食品这两个类目的退货率分别是多少？
+  gold_sql: |
+    SELECT p.category_l1,
+           COUNT(DISTINCT r.order_id)::numeric
+             / NULLIF(COUNT(DISTINCT o.order_id), 0) AS refund_rate
+    FROM orders o
+    JOIN order_items oi ON oi.order_id = o.order_id
+    JOIN dim_product p ON p.product_id = oi.product_id
+    LEFT JOIN refunds r
+           ON r.order_id = o.order_id
+          AND r.refund_status = 'approved'
+    WHERE o.order_status <> 'cancelled'
+      AND p.category_l1 IN ('服装', '食品')
+    GROUP BY p.category_l1;
+  check: unordered_set
+  traps: [2, 6, 11]
+  note: >
+    陷阱⑪的核心：必须 LEFT JOIN refunds，把"没有退款的订单"保留在分母里，
+    否则算出来的是"退款订单中有多少是退货"而不是"退货率"。
+    服装的退货率应当显著高于食品（数据集里分别约 18% 与 4%），
+    这个差距本身就是检验答案是否可信的合理性信号。
+
+- id: Q019
+  category: 比率统计
+  difficulty: medium
+  question: 整体折扣力度有多大？（优惠金额占吊牌金额的比例）
+  gold_sql: |
+    SELECT SUM(discount_amount)::numeric / NULLIF(SUM(total_amount), 0) AS discount_rate
+    FROM orders
+    WHERE order_status <> 'cancelled';
+  check: approx
+  tolerance: 0.02
+  traps: [6, 7]
+  note: >
+    陷阱⑦。折扣率的分母是 total_amount（吊牌价合计），
+    不是 pay_amount —— 用实付做分母会得到一个永远偏大的数。
+    注意 `discount / (discount + pay)` 这类"看起来等价"的写法也是错的，
+    因为 pay 里含运费和积分抵扣。
+
+- id: Q020
+  category: 比率统计
+  difficulty: medium
+  question: 有多少比例的订单是跨地区收货的？
+  gold_sql: |
+    SELECT COUNT(*) FILTER (WHERE o.region_id <> c.region_id)::numeric
+           / NULLIF(COUNT(*), 0) AS cross_region_rate
+    FROM orders o
+    JOIN dim_customer c ON c.customer_id = o.customer_id;
+  check: approx
+  tolerance: 0.02
+  traps: [5]
+  note: >
+    陷阱⑤的反向用法：前面几条题在纠结"用哪个 region_id"，
+    这条题恰恰需要**同时用两个**并比较它们。
+    答案约 15% —— 这个数字直接解释了为什么"华东用户"这类问法有歧义。
+
+- id: Q021
+  category: 比率统计
+  difficulty: hard
+  question: 我们想对一下账：把所有商品明细的金额加起来，相当于订单实付总额的多少倍？
+  gold_sql: |
+    SELECT (SELECT SUM(item_amount) FROM order_items)::numeric
+           / NULLIF((SELECT SUM(pay_amount) FROM orders WHERE order_status <> 'cancelled'), 0) AS ratio;
+  check: approx
+  tolerance: 0.05
+  traps: [6, 10]
+  note: >
+    陷阱⑩ —— 整套评测集里唯一一条直接量化"两个口径差多少"的题。
+    明细加总（item_amount）按吊牌价累计，实付（pay_amount）是扣掉优惠、
+    积分抵扣又加上运费之后的钱，两者必然不等（本数据集里比值约 1.18）。
+    这条题的价值在于：它把"销售额到底指什么"从一个抽象争论，
+    变成了一个可以印在报表上的具体倍数。
+    如果系统对这类题不做任何口径声明就直接给一个数，说明语义层还没建起来。
