@@ -213,6 +213,7 @@ DataLedger/
 │  └─ guard/              # [Stage 2] 三层护栏：静态检查 / 极限值注入 / 白名单
 ├─ docs/
 │  ├─ DESIGN.md           # 为什么做 / 怎么设计 / 做到哪了
+│  ├─ INTERVIEW.md        # 定位、可追问点、深挖方向、自查清单
 │  └─ METRICS-LOG.md      # 每次改动的指标前后对比（没有数字的改动不算改动）
 └─ tests/
 ```
