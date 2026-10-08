@@ -59,8 +59,11 @@ SELECT SUM(pay_amount) FROM orders WHERE order_status <> 'cancelled' AND ...;
 | 维表规模 | — | 91 地区（7 大区）/ 300 商品（5 类目 × 4 子类） |
 | Schema 口径陷阱数 | ≥12 个 | **12 个**（见 `db/schema.sql`） |
 | 造数逻辑测试 | 全绿 | **29 passed / 0.73s** |
+| 判分器测试 | 全绿 | **56 passed**（每条判定决策配正反两个用例） |
 | 评测用例数 | 300 条 | **21 条**（已覆盖全部 12 个陷阱） |
-| 首次可执行率 | > 90% | 待测（Stage 1 出基线） |
+| 评测框架自检（gold 引擎） | 21/21 | **21/21 通过**（2026-10-08） |
+| 判分器拒绝率（错误答案） | 100% | **21/21**，洞 0（2026-10-08） |
+| 首次可执行率 | > 90% | 待测（Stage 1 Step 2 出基线） |
 | 答案准确率 | > 80% | 待测（对比 gold SQL 结果集） |
 | 危险语句拦截率 | 100% | 待测（Stage 2） |
 | 正常问题误拦率 | 0% | 待测（Stage 2） |
@@ -160,11 +163,28 @@ python db/seed.py --dsn "..." --reset
 这些数字同时也是面试时的素材：**"我的数据集里 14.79% 的订单跨区收货，
 所以『华东用户』这个问法必然产生歧义"** —— 这类具体数字比"我做了个 NL2SQL"有说服力得多。
 
-### 3. 跑测试
+### 3. 跑评测
+
+```bash
+# 自检：用标准答案当"模型答案"跑一遍。必须满 21/21。
+python eval/run_eval.py --engine gold
+
+# 验证判分器"有牙齿"：21 条能执行但答错的 SQL，必须全部被判为未通过
+python eval/verify_grader.py
+```
+
+`run_eval.py` 支持 `--only Q001,Q017` / `--category 比率统计` / `--trap 10` 筛选，
+并在 `eval/reports/` 下同时落 JSON 与 Markdown 报告（含按分类、按检查方式、
+**按陷阱**的通过率分解）。`--fail-under 0.9` 可作为 CI 门禁。
+
+### 4. 跑测试
 
 ```bash
 python -m unittest discover -s tests -v
 ```
+
+包含两组：造数逻辑（29 个，验证 12 个陷阱真的被造出来）与
+判分器/切分器（56 个，每条判定决策都配了正反两个用例）。
 
 ---
 
@@ -174,13 +194,25 @@ python -m unittest discover -s tests -v
 DataLedger/
 ├─ db/
 │  ├─ schema.sql          # 六张表 + 外键 + 索引 + 12 个口径陷阱 + 只读账号 DDL
-│  └─ seed.py             # 造数脚本（含陷阱特征自检）
-├─ eval/                  # 评测集与评测脚本（评测先行）
+│  ├─ seed.py             # 造数脚本（含陷阱特征自检）
+│  └─ quickstart.sql      # pgAdmin 上手脚本（10 段，每段附实测预期值）
+├─ eval/                  # 评测（评测先行）
+│  ├─ cases.yaml          # 21 条用例，覆盖全部 12 个陷阱
+│  ├─ negatives.yaml      # 21 条"能执行但答错"的 SQL —— 用来验证判分器会拒绝
+│  ├─ run_eval.py         # 评测入口：执行 → 判分 → 汇总 → 报告
+│  └─ verify_grader.py    # 判分器"牙齿"验证（CI 可直接用）
 ├─ app/
-│  ├─ sqlgen/             # 语义层 + Schema 检索 + SQL 生成
-│  ├─ guard/              # 三层护栏：静态检查 / 极限值注入 / 白名单
-│  └─ execute/            # 执行、错误回喂、自校验重试
+│  ├─ config.py           # .env 读取 + 运行参数（超时 / 行数上限）
+│  ├─ db.py               # 只读连接（READ ONLY + statement_timeout）
+│  ├─ execute/
+│  │  ├─ result.py        # 结果规整（统一 Decimal、保证行可哈希）
+│  │  ├─ runner.py        # SQL 执行器 + 词法级分号切分
+│  │  └─ grader.py        # 判分器：exact / approx / unordered_set
+│  ├─ engines/            # SQL 来源抽象（gold / llm）
+│  ├─ sqlgen/             # [Stage 1 Step 2] 语义层 + Schema 检索 + SQL 生成
+│  └─ guard/              # [Stage 2] 三层护栏：静态检查 / 极限值注入 / 白名单
 ├─ docs/
+│  ├─ DESIGN.md           # 为什么做 / 怎么设计 / 做到哪了
 │  └─ METRICS-LOG.md      # 每次改动的指标前后对比（没有数字的改动不算改动）
 └─ tests/
 ```

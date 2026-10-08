@@ -1,0 +1,282 @@
+# =============================================================================
+# DataLedger · 判分器"牙齿"验证集（负面用例）
+# =============================================================================
+#
+# 【这个文件回答什么问题】
+#
+# gold 引擎跑出 21/21 只证明了一件事：判分器**不会误杀正确答案**。
+# 它完全没证明另一件同样重要的事：判分器**会不会放过错误答案**。
+#
+# 一个永远返回"通过"的判分器，也会给出漂亮的 21/21。
+# 而"通过率"这个东西一旦失去可信度，整个项目就没有存在意义了。
+#
+# 所以这里每条用例都配一条 **错误但可执行** 的 SQL：
+#   - 必须能跑起来（不能靠语法错误蒙混过关，那验的是执行器不是判分器）
+#   - 必须真的答错（偏离幅度要能看出来，不能靠噪声级别的差异）
+#   - 每条都对应一个明确的错误成因，写在 `wrong` 字段里
+#
+# 验证脚本 eval/verify_grader.py 会断言：这些 SQL **全部**被判为未通过。
+# 只要有一条被判通过 —— 说明判分器有洞，整套评测的数字立刻失去意义。
+#
+# 【和 cases.yaml 的关系】
+#   case_id 指向 cases.yaml 里的标准答案；
+#   gold_sql 从这里引用，不需要重复写。
+# =============================================================================
+
+meta:
+  version: "0.1"
+  purpose: 用"能执行但答错"的 SQL 验证判分器会拒绝错误答案
+
+negatives:
+
+# --- 陷阱⑥：取消单 -----------------------------------------------------------
+- id: N001
+  case_id: Q001
+  traps: [6]
+  wrong: 没有排除已取消订单，把取消单也算成有效订单
+  sql: |
+    SELECT COUNT(*) AS valid_orders
+    FROM orders;
+
+- id: N002
+  case_id: Q002
+  traps: [6, 7]
+  wrong: 金额字段选错（用吊牌价减优惠，而不是实付金额）
+  sql: |
+    SELECT SUM(total_amount - discount_amount) AS gmv
+    FROM orders
+    WHERE order_status <> 'cancelled';
+
+# --- 陷阱⑨：口径选择（件数 vs 明细行数） --------------------------------------
+- id: N003
+  case_id: Q003
+  traps: [6, 9]
+  wrong: 把"卖了多少件"理解成"有多少条明细行"，算的是行数不是件数
+  sql: |
+    SELECT COUNT(*) AS total_units
+    FROM order_items oi
+    JOIN orders o ON o.order_id = oi.order_id
+    WHERE o.order_status <> 'cancelled';
+
+# --- 陷阱①：大区命名 --------------------------------------------------------
+- id: N004
+  case_id: Q004
+  traps: [1]
+  wrong: 用户说"华东"，SQL 就写 '华东'——库里存的是 '华东区'，静默返回 0
+  sql: |
+    SELECT COUNT(DISTINCT city) AS city_count
+    FROM dim_region
+    WHERE region_group = '华东';
+
+# --- 陷阱②：两级类目 / 陷阱③：成本价 ----------------------------------------
+- id: N005
+  case_id: Q005
+  traps: [2, 3, 6]
+  wrong: 毛利率的分子分母写反了（算成了成本率，与毛利率互为补数）
+  sql: |
+    SELECT SUM(oi.quantity * p.cost_price) / SUM(oi.item_amount) AS gross_margin
+    FROM order_items oi
+    JOIN dim_product p ON p.product_id = oi.product_id
+    JOIN orders o ON o.order_id = oi.order_id
+    WHERE p.category_l1 = '服装'
+      AND o.order_status <> 'cancelled';
+
+# --- 陷阱⑤：注册地 vs 收货地 ------------------------------------------------
+- id: N006
+  case_id: Q006
+  traps: [5, 6]
+  wrong: 按用户注册地统计，而不是题目要求的收货地
+  sql: |
+    SELECT SUM(o.pay_amount) AS gmv
+    FROM orders o
+    JOIN dim_customer c ON c.customer_id = o.customer_id
+    JOIN dim_region r ON r.region_id = c.region_id
+    WHERE r.province = '广东省'
+      AND o.order_status <> 'cancelled';
+
+- id: N007
+  case_id: Q007
+  traps: [2, 6]
+  wrong: 二级类目「男装」被拿去和一级类目字段比较 —— 静默命中 0 行
+  sql: |
+    SELECT SUM(oi.quantity) AS units
+    FROM order_items oi
+    JOIN dim_product p ON p.product_id = oi.product_id
+    JOIN orders o ON o.order_id = oi.order_id
+    WHERE p.category_l1 = '男装'
+      AND o.order_status <> 'cancelled';
+
+# --- 陷阱④：生日与 NULL ------------------------------------------------------
+- id: N008
+  case_id: Q008
+  traps: [4]
+  wrong: 把"没有生日记录"的用户也算进了某个年龄段
+  sql: |
+    SELECT COUNT(*) AS user_count
+    FROM dim_customer
+    WHERE birth_date IS NULL
+       OR birth_date <= CURRENT_DATE - INTERVAL '30 years';
+
+# --- 陷阱⑧：日期 vs 时间戳 ---------------------------------------------------
+- id: N009
+  case_id: Q009
+  traps: [6, 8]
+  wrong: 拿 DATE 和 TIMESTAMP 直接相等比较，只命中当天零点整那一秒
+  sql: |
+    SELECT COUNT(*) AS orders_on_day
+    FROM orders
+    WHERE order_time = DATE '2026-03-01'
+      AND order_status <> 'cancelled';
+
+- id: N010
+  case_id: Q010
+  traps: [6, 8]
+  wrong: 右边界用 <= 当月最后一天，漏掉 6 月 30 日当天带时分秒的订单
+  sql: |
+    SELECT SUM(pay_amount) AS gmv
+    FROM orders
+    WHERE order_time BETWEEN DATE '2026-06-01' AND DATE '2026-06-30'
+      AND order_status <> 'cancelled';
+
+- id: N011
+  case_id: Q011
+  traps: [6, 8]
+  wrong: 最近 7 天被理解成最近 6 天（少算一天）
+  sql: |
+    SELECT COUNT(*) AS recent_orders
+    FROM orders
+    WHERE order_time >= CURRENT_DATE - INTERVAL '6 days'
+      AND order_status <> 'cancelled';
+
+- id: N012
+  case_id: Q012
+  traps: [6, 8]
+  wrong: 把"高出多少倍"理解成"占当月总量的比例"
+  sql: |
+    WITH nov AS (
+      SELECT DATE(order_time) AS d, COUNT(*) AS cnt
+      FROM orders
+      WHERE order_time >= DATE '2025-11-01'
+        AND order_time < DATE '2025-12-01'
+        AND order_status <> 'cancelled'
+      GROUP BY 1
+    )
+    SELECT MAX(cnt) FILTER (WHERE d = DATE '2025-11-11')::numeric
+           / NULLIF(SUM(cnt), 0) AS peak_ratio
+    FROM nov;
+
+# --- 排行类：分组维度错 / JOIN 目标错 ----------------------------------------
+- id: N013
+  case_id: Q013
+  traps: [2, 6, 9]
+  wrong: 按二级类目分组，而不是题目要的一级类目
+  sql: |
+    SELECT p.category_l2, SUM(oi.quantity) AS units
+    FROM order_items oi
+    JOIN dim_product p ON p.product_id = oi.product_id
+    JOIN orders o ON o.order_id = oi.order_id
+    WHERE o.order_status <> 'cancelled'
+    GROUP BY p.category_l2
+    ORDER BY units DESC
+    LIMIT 5;
+
+- id: N014
+  case_id: Q014
+  traps: [5, 6, 7]
+  wrong: 省份排名用了用户注册地，而不是订单收货地
+  sql: |
+    SELECT r.province, SUM(o.pay_amount) AS gmv
+    FROM orders o
+    JOIN dim_customer c ON c.customer_id = o.customer_id
+    JOIN dim_region r ON r.region_id = c.region_id
+    WHERE o.order_status <> 'cancelled'
+    GROUP BY r.province
+    ORDER BY gmv DESC
+    LIMIT 5;
+
+- id: N015
+  case_id: Q015
+  traps: [3, 6]
+  wrong: 算成本时忘了乘数量（把单价成本当成了总成本）
+  sql: |
+    SELECT p.product_name,
+           SUM(oi.item_amount) AS revenue,
+           (SUM(oi.item_amount) - SUM(p.cost_price)) / NULLIF(SUM(oi.item_amount), 0) AS gross_margin
+    FROM order_items oi
+    JOIN dim_product p ON p.product_id = oi.product_id
+    JOIN orders o ON o.order_id = oi.order_id
+    WHERE o.order_status <> 'cancelled'
+    GROUP BY p.product_id, p.product_name
+    HAVING SUM(oi.item_amount) > 100000
+    ORDER BY gross_margin DESC
+    LIMIT 5;
+
+- id: N016
+  case_id: Q016
+  traps: []
+  wrong: 对照组。按省份分组而不是大区 —— 用于确认判分器不是"只对特定题苛刻"
+  sql: |
+    SELECT r.province, COUNT(*) AS user_count
+    FROM dim_customer c
+    JOIN dim_region r ON r.region_id = c.region_id
+    GROUP BY r.province
+    ORDER BY user_count DESC
+    LIMIT 5;
+
+# --- 陷阱⑪⑫：退货率 --------------------------------------------------------
+- id: N017
+  case_id: Q017
+  traps: [11, 12]
+  wrong: 分子含 pending/rejected，分母含已取消订单 —— 两头口径都不对
+  sql: |
+    SELECT (SELECT COUNT(*)::numeric FROM refunds)
+           / NULLIF((SELECT COUNT(*) FROM orders), 0) AS refund_rate;
+
+- id: N018
+  case_id: Q018
+  traps: [2, 6, 11]
+  wrong: 退货率用 INNER JOIN 算 —— "没有退款的订单"被丢出分母，比率恒等于 1
+  sql: |
+    SELECT p.category_l1,
+           COUNT(DISTINCT r.order_id)::numeric
+             / NULLIF(COUNT(DISTINCT o.order_id), 0) AS refund_rate
+    FROM orders o
+    JOIN order_items oi ON oi.order_id = o.order_id
+    JOIN dim_product p ON p.product_id = oi.product_id
+    JOIN refunds r
+           ON r.order_id = o.order_id
+          AND r.refund_status = 'approved'
+    WHERE o.order_status <> 'cancelled'
+      AND p.category_l1 IN ('服装', '食品')
+    GROUP BY p.category_l1;
+
+- id: N019
+  case_id: Q019
+  traps: [6, 7]
+  wrong: 折扣率的分母用了实付金额（比吊牌金额小），结果永远偏大
+  sql: |
+    SELECT SUM(discount_amount)::numeric / NULLIF(SUM(pay_amount), 0) AS discount_rate
+    FROM orders
+    WHERE order_status <> 'cancelled';
+
+- id: N020
+  case_id: Q020
+  traps: [5]
+  wrong: 算成了"同地区收货比例"（跨地区的补数）
+  sql: |
+    SELECT COUNT(*) FILTER (WHERE o.region_id = c.region_id)::numeric
+           / NULLIF(COUNT(*), 0) AS cross_region_rate
+    FROM orders o
+    JOIN dim_customer c ON c.customer_id = o.customer_id;
+
+# --- 陷阱⑩：明细加总 vs 实付 ------------------------------------------------
+- id: N021
+  case_id: Q021
+  traps: [6, 10]
+  wrong: >
+    分子不 JOIN 回订单表排除取消单，分母排除了 —— 一边含取消单一边不含。
+    ★ 这条正是 gold_sql 自己踩过的坑（见 cases.yaml Q021 的 note）。
+    把它放进负面集，是为了保证同一个错误不会被判分器放过第二次。
+  sql: |
+    SELECT (SELECT SUM(oi.item_amount) FROM order_items oi)::numeric
+           / NULLIF((SELECT SUM(pay_amount) FROM orders WHERE order_status <> 'cancelled'), 0) AS ratio;
