@@ -17,7 +17,7 @@ SQL 来源引擎：评测框架与"这条 SQL 是谁写的"之间的唯一接口
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Protocol, runtime_checkable
+from typing import Any, Protocol, runtime_checkable
 
 __all__ = ["Generation", "SqlEngine", "build_engine"]
 
@@ -45,8 +45,17 @@ class SqlEngine(Protocol):
         ...
 
 
-def build_engine(name: str) -> SqlEngine:
-    """按名字造引擎。未实现的引擎在这里显式报错，而不是跑到一半才炸。"""
+def build_engine(
+    name: str,
+    *,
+    settings: Any = None,
+    schema_mode: str = "raw",
+) -> SqlEngine:
+    """
+    按名字造引擎。未实现的引擎在这里显式报错，而不是跑到一半才炸。
+
+    settings / schema_mode 只有 llm 引擎用得上，gold 引擎忽略它们。
+    """
     normalized = (name or "").strip().lower()
 
     if normalized == "gold":
@@ -55,14 +64,9 @@ def build_engine(name: str) -> SqlEngine:
         return GoldEngine()
 
     if normalized == "llm":
-        try:
-            from app.engines.llm import LlmEngine
-        except ImportError as exc:  # pragma: no cover - 依赖缺失时的提示
-            raise SystemExit(
-                "[x] llm 引擎尚未就绪。\n"
-                "    Stage 1 Step 2 才会实现它（需要先配好模型 API key）。\n"
-                f"    原始导入错误：{exc}"
-            ) from None
-        return LlmEngine()
+        from app.config import Settings
+        from app.engines.llm import LlmEngine
+
+        return LlmEngine(settings or Settings.load(), schema_mode=schema_mode)
 
     raise SystemExit(f"[x] 未知引擎 {name!r}，可选：gold | llm")

@@ -60,11 +60,15 @@ SELECT SUM(pay_amount) FROM orders WHERE order_status <> 'cancelled' AND ...;
 | Schema 口径陷阱数 | ≥12 个 | **12 个**（见 `db/schema.sql`） |
 | 造数逻辑测试 | 全绿 | **29 passed / 0.73s** |
 | 判分器测试 | 全绿 | **56 passed**（每条判定决策配正反两个用例） |
+| SQL 生成层测试 | 全绿 | **64 passed**（不联网、不需要 API key） |
+| 单元测试合计 | 全绿 | **149 passed / 0.64s** |
 | 评测用例数 | 300 条 | **21 条**（已覆盖全部 12 个陷阱） |
 | 评测框架自检（gold 引擎） | 21/21 | **21/21 通过**（2026-10-08） |
 | 判分器拒绝率（错误答案） | 100% | **21/21**，洞 0（2026-10-08） |
-| 首次可执行率 | > 90% | 待测（Stage 1 Step 2 出基线） |
-| 答案准确率 | > 80% | 待测（对比 gold SQL 结果集） |
+| 首次可执行率 | > 90% | **待测**（代码已就绪，等 API key；`raw` 档为诚实基线） |
+| 答案准确率 | > 80% | **待测**（代码已就绪，等 API key） |
+| 单次问答成本 | < ¥0.05 | **待测**（框架已在报告里输出 token/成本/延迟） |
+| P95 端到端延迟 | < 8s | **待测**（同上） |
 | 危险语句拦截率 | 100% | 待测（Stage 2） |
 | 正常问题误拦率 | 0% | 待测（Stage 2） |
 
@@ -166,16 +170,36 @@ python db/seed.py --dsn "..." --reset
 ### 3. 跑评测
 
 ```bash
-# 自检：用标准答案当"模型答案"跑一遍。必须满 21/21。
+# ① 自检：用标准答案当"模型答案"跑一遍。必须满 21/21。
 python eval/run_eval.py --engine gold
 
-# 验证判分器"有牙齿"：21 条能执行但答错的 SQL，必须全部被判为未通过
+# ② 验证判分器"有牙齿"：21 条能执行但答错的 SQL，必须全部被判为未通过
 python eval/verify_grader.py
+
+# ③ 让大模型来写 SQL，拿真实基线（需要先在 .env 里配 DEEPSEEK_API_KEY）
+python eval/run_eval.py --engine llm --schema-mode raw
 ```
 
-`run_eval.py` 支持 `--only Q001,Q017` / `--category 比率统计` / `--trap 10` 筛选，
+`--schema-mode` 控制给模型的 schema 详略，**这三档的差值就是"把口径写下来"的价值**：
+
+| 档位 | 给模型看什么 | 对应现实 |
+|---|---|---|
+| `raw` | 只有表名/列名/类型 | 朴素 NL2SQL，诚实基线 |
+| `comments` | 再加列注释（含 `[陷阱N]` 的整条丢弃，见下） | 字段文档写得还行的库 |
+| `full` | 再加每张表行数 | 有基本运维文档的库 |
+
+> `comments` 档为什么要把含标记的注释**整条**丢掉：本项目 schema 的注释里，
+> `[陷阱①]` 后面跟的就是答案解析（"等值匹配会返回 0 行，必须走语义层归一"）。
+> 原样喂给模型等于抄答案。而**真实世界的注释也不会写"这里是坑"** ——
+> 这件事同时说明：语义层必须单独做，不能拿调试笔记当口径定义。
+
+`run_eval.py` 还支持 `--only Q001,Q017` / `--category 比率统计` / `--trap 10` 筛选，
 并在 `eval/reports/` 下同时落 JSON 与 Markdown 报告（含按分类、按检查方式、
-**按陷阱**的通过率分解）。`--fail-under 0.9` 可作为 CI 门禁。
+**按陷阱**的通过率分解，以及 `llm` 引擎下的 token / 成本 / P50·P95 延迟）。
+`--fail-under 0.9` 可作为 CI 门禁。
+
+**退出码约定**：`0` 正常 ｜ `1` 未达 `--fail-under` ｜ `2` 评测框架自身有问题或引擎未就绪
+（第 2 种意味着"这一轮数字不可信"，CI 里必须当硬失败）。
 
 ### 4. 跑测试
 
@@ -208,9 +232,13 @@ DataLedger/
 │  │  ├─ result.py        # 结果规整（统一 Decimal、保证行可哈希）
 │  │  ├─ runner.py        # SQL 执行器 + 词法级分号切分
 │  │  └─ grader.py        # 判分器：exact / approx / unordered_set
-│  ├─ engines/            # SQL 来源抽象（gold / llm）
-│  ├─ sqlgen/             # [Stage 1 Step 2] 语义层 + Schema 检索 + SQL 生成
-│  └─ guard/              # [Stage 2] 三层护栏：静态检查 / 极限值注入 / 白名单
+│  ├─ engines/            # SQL 来源抽象（gold / llm）+ Generation 协议
+│  ├─ sqlgen/
+│  │  ├─ schema_card.py   # 把库结构渲染成模型能看的文本（raw/comments/full）
+│  │  ├─ prompt.py        # 提示词组装（刻意不写业务口径，保证基线诚实）
+│  │  └─ generator.py     # 调 DeepSeek 生成 SQL（不重试、temperature 0）
+│  └─ guard/              # [Stage 2] 三层护栏：AST 静态检查 / 资源限制
+├─ env.example            # 环境变量模板（不含凭据，可入库）
 ├─ docs/
 │  ├─ DESIGN.md           # 为什么做 / 怎么设计 / 做到哪了
 │  ├─ INTERVIEW.md        # 定位、可追问点、深挖方向、自查清单

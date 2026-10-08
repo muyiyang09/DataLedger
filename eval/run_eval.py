@@ -65,6 +65,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument("--engine", default="gold", help="SQL 来源：gold | llm")
+    parser.add_argument(
+        "--schema-mode",
+        default="raw",
+        choices=["raw", "comments", "full"],
+        help=(
+            "给模型的 schema 详略（只对 llm 引擎有效）："
+            "raw=只有表名列名类型（诚实基线）｜comments=加列注释（剥掉[陷阱N]标记）｜"
+            "full=再加行数"
+        ),
+    )
     parser.add_argument("--cases", default=str(PROJECT_ROOT / "eval" / "cases.yaml"))
     parser.add_argument("--only", default="", help="只跑指定用例 id，逗号分隔")
     parser.add_argument("--category", default="", help="只跑指定分类（模糊匹配）")
@@ -146,6 +156,47 @@ def run_case(conn: psycopg.Connection, case: dict, engine, settings: Settings, s
 
     verdict = grade(case, gold_result, model_result, set_decimals=set_decimals)
     return verdict, generation
+
+
+def collect_llm_usage(generations: list) -> dict | None:
+    """
+    汇总 token / 延迟 / 成本。
+
+    这些数字是 README 指标表里"单次问答成本 < ¥0.05""P95 延迟 < 8s"两行的来源
+    —— 没有它们，那两行永远只能写"待测"。
+    """
+    metas = [g.meta for g in generations if getattr(g, "meta", None)]
+    if not metas:
+        return None
+
+    tokens_in = sum(int(m.get("prompt_tokens") or 0) for m in metas)
+    tokens_out = sum(int(m.get("completion_tokens") or 0) for m in metas)
+    cost = sum(float(m.get("cost_cny") or 0.0) for m in metas)
+
+    latencies = sorted(
+        float(m["latency_ms"]) for m in metas if m.get("latency_ms") is not None
+    )
+
+    def percentile(p: float) -> float | None:
+        if not latencies:
+            return None
+        index = min(len(latencies) - 1, max(0, round((len(latencies) - 1) * p)))
+        return round(latencies[index], 1)
+
+    return {
+        "calls": len(metas),
+        "model": next((m.get("model") for m in metas if m.get("model")), None),
+        "schema_mode": next(
+            (m.get("schema_mode") for m in metas if m.get("schema_mode")), None
+        ),
+        "prompt_tokens": tokens_in,
+        "completion_tokens": tokens_out,
+        "total_tokens": tokens_in + tokens_out,
+        "cost_cny": round(cost, 4),
+        "cost_cny_per_call": round(cost / len(metas), 6) if metas else None,
+        "latency_ms_p50": percentile(0.5),
+        "latency_ms_p95": percentile(0.95),
+    }
 
 
 def summarize(verdicts: list, cases: list[dict], engine_name: str, elapsed_s: float) -> dict:
@@ -241,6 +292,24 @@ def print_summary(summary: dict, verdicts: list) -> None:
     )
     print("=" * 100)
 
+    usage = summary.get("llm_usage")
+    if usage:
+        print("\n-- 模型用量（成本与延迟指标的来源）--")
+        print(f"  {pad('模型', 18)} {usage['model']}（schema={usage['schema_mode']}）")
+        print(f"  {pad('调用次数', 18)} {usage['calls']}")
+        print(
+            f"  {pad('token 合计', 18)} {usage['total_tokens']:,}"
+            f"（入 {usage['prompt_tokens']:,} / 出 {usage['completion_tokens']:,}）"
+        )
+        print(
+            f"  {pad('成本合计', 18)} ¥{usage['cost_cny']}"
+            f"（单次 ¥{usage['cost_cny_per_call']}）"
+        )
+        print(
+            f"  {pad('延迟 P50/P95', 18)} "
+            f"{usage['latency_ms_p50']} ms / {usage['latency_ms_p95']} ms"
+        )
+
     def table(title: str, bucket: dict, key_fmt=str) -> None:
         if not bucket:
             return
@@ -314,6 +383,24 @@ def build_markdown(summary: dict, verdicts: list, cases: list[dict], meta: dict)
         lines.append(f"- ⚠️ 评测框架问题：{summary['harness_issue_count']} 条（见文末）")
     lines.append("")
 
+    usage = summary.get("llm_usage")
+    if usage:
+        lines.append("## 模型用量")
+        lines.append("")
+        lines.append(f"- 模型：`{usage['model']}`（schema 详略：{usage['schema_mode']}）")
+        lines.append(f"- 调用次数：{usage['calls']}")
+        lines.append(
+            f"- token 合计：{usage['total_tokens']:,}"
+            f"（入 {usage['prompt_tokens']:,} / 出 {usage['completion_tokens']:,}）"
+        )
+        lines.append(
+            f"- 成本合计：¥{usage['cost_cny']}（**单次 ¥{usage['cost_cny_per_call']}**）"
+        )
+        lines.append(
+            f"- 延迟：P50 {usage['latency_ms_p50']} ms ｜ P95 {usage['latency_ms_p95']} ms"
+        )
+        lines.append("")
+
     lines.append("## 用例明细")
     lines.append("")
     lines.append("| 用例 | 分类 | 难度 | 检查 | 陷阱 | 结果 | 说明 |")
@@ -385,8 +472,17 @@ def main(argv: list[str] | None = None) -> int:
     cases_path = Path(args.cases)
     cases_all = load_cases(cases_path)
     cases = filter_cases(cases_all, args)
-    engine = build_engine(args.engine)
     settings = Settings.load()
+    engine = build_engine(args.engine, settings=settings, schema_mode=args.schema_mode)
+
+    # 引擎就绪自检：配置不全就当场说清。否则会跑出 21 条"SQL 执行失败"的假结果，
+    # 看起来像"模型很差"，实际是没配 key —— 这种数字比没有数字更坏。
+    probe = getattr(engine, "check_ready", None)
+    if callable(probe):
+        problem = probe()
+        if problem:
+            print(f"[x] {args.engine} 引擎未就绪：\n    {problem}")
+            return 2
 
     try:
         with db.connect(settings) as conn:
@@ -400,11 +496,13 @@ def main(argv: list[str] | None = None) -> int:
 
             started = time.perf_counter()
             verdicts: list = []
+            generations: list = []
             for index, case in enumerate(cases, start=1):
-                verdict, _generation = run_case(
+                verdict, generation = run_case(
                     conn, case, engine, settings, args.set_decimals
                 )
                 verdicts.append(verdict)
+                generations.append(generation)
                 print_case_line(index, len(cases), verdict, case, args.quiet)
 
             elapsed = time.perf_counter() - started
@@ -417,6 +515,7 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     summary = summarize(verdicts, cases, engine.name, elapsed)
+    summary["llm_usage"] = collect_llm_usage(generations)
     print_summary(summary, verdicts)
 
     run_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
