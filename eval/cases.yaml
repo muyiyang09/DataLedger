@@ -359,12 +359,14 @@ cases:
     WHERE r.refund_status = 'approved';
   check: approx
   tolerance: 0.02
-  traps: [11, 12]
+  traps: [6, 11, 12]
   note: >
-    陷阱⑪⑫。这题的"错法"极其多：
-      分子要不要只算 approved？（要 —— pending/rejected 占 30%）
-      分子用 COUNT(*) 还是 COUNT(DISTINCT order_id)？（要 distinct，一个订单可能多行退款）
-      分母要不要排除 cancelled？（要）
+    陷阱⑪⑫（另需⑥：分母必须排除取消单）。这题的"错法"极其多：
+      分子要不要只算 approved？（要 —— pending/rejected 占 29.15%）
+      分子用 COUNT(*) 还是 COUNT(DISTINCT order_id)？（要 distinct。本数据集一个订单
+        最多只有一条退款记录，所以这两种写法答案相同 —— 但真实库里同一订单可能多行退款，
+        这里坚持 distinct 是"写法上不依赖数据巧合"）
+      分母要不要排除 cancelled？（要 —— 这也是本用例原先漏标陷阱⑥的地方）
       分母是订单数、明细行数还是金额？（三种都能自圆其说，必须定义）
     而且用 JOIN 代替子查询时，整单退（item_id IS NULL）会被静默丢掉。
     这题基本是整套评测里信息量最大的一条。
