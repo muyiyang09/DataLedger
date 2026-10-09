@@ -411,6 +411,32 @@ class TestSqlGenerator(unittest.TestCase):
         self.assertFalse(generation.ok)
         self.assertIn("空内容", generation.error)
 
+    def test_truncated_is_not_reported_as_empty_content(self):
+        """finish_reason=length 是评测配置问题，不能记成"模型返回了空内容"。
+
+        这条是被真实数据抓出来的：deepseek-v4-flash 的 reasoning_content 同样占用
+        max_tokens，推理吃满额度后正文为空，而它在报告里和"模型不会答"长得一模一样。
+        两者混在一起，跑出来的准确率就不干净了。
+        """
+
+        def transport(*_args):
+            return {
+                "model": "deepseek-v4-flash",
+                "choices": [{"message": {"content": ""}, "finish_reason": "length"}],
+                "usage": {
+                    "prompt_tokens": 1200,
+                    "completion_tokens": 1024,
+                    "total_tokens": 2224,
+                },
+            }
+
+        generation = make_generator(transport).generate("问题", "S")
+        self.assertFalse(generation.ok)
+        self.assertIn("截断", generation.error)
+        self.assertNotIn("空内容", generation.error)
+        self.assertEqual(generation.meta["finish_reason"], "length")
+        self.assertEqual(generation.meta["completion_tokens"], 1024)
+
     def test_no_choices_is_error(self):
         generation = make_generator(lambda *a: {"choices": []}).generate("问题", "S")
         self.assertFalse(generation.ok)

@@ -271,8 +271,23 @@ class SqlGenerator:
         }
 
         if not sql:
+            finish_reason = choices[0].get("finish_reason")
+            # 「被截断」和「模型就是没输出」是两回事。
+            # 混为一谈的后果是被真实数据抓出来的：deepseek-v4-flash 是推理模型，
+            # reasoning_content 同样占用 max_tokens，推理一吃满额度正文就是空的，
+            # 而 finish_reason 会老老实实写 length。
+            # 如果不分开，评测配置的缺陷会被算成模型能力不足。
+            if finish_reason == "length":
+                return Generation(
+                    error=(
+                        f"响应被 max_tokens={self.config.max_tokens} 截断"
+                        f"（finish_reason=length，completion_tokens={completion_tokens}）"
+                        "—— 推理内容占满了额度，正文没来得及产出"
+                    ),
+                    meta=meta,
+                )
             return Generation(
-                error="模型返回了空内容",
+                error=f"模型返回了空内容（finish_reason={finish_reason}）",
                 meta=meta,
             )
         return Generation(sql=sql, meta=meta)

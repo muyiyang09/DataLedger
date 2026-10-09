@@ -155,6 +155,17 @@ def run_case(conn: psycopg.Connection, case: dict, engine, settings: Settings, s
         model_result = QueryResult(sql=generation.sql, error=generation.error or "生成失败")
 
     verdict = grade(case, gold_result, model_result, set_decimals=set_decimals)
+
+    # 截断不是"模型答不出来"，是评测把额度给少了 —— 必须和模型能力分开计。
+    # 少了这一条，一轮跑出来的准确率里会混进 harness 自己的缺陷，
+    # 而它看起来和"模型答错"一模一样。
+    meta = generation.meta or {}
+    if meta.get("finish_reason") == "length":
+        verdict.harness = True
+        verdict.reason = (
+            f"响应被 max_tokens 截断（completion_tokens={meta.get('completion_tokens')}），"
+            "模型没来得及输出 SQL —— 这是评测配置问题，不是模型能力问题"
+        )
     return verdict, generation
 
 
