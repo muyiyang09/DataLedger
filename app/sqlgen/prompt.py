@@ -12,6 +12,12 @@
 一句都不碰**业务口径**。口径要靠后面的语义层去解决，而且到时候
 要拿"接语义层前 vs 后"的差值来说话。基线被虚高，后面的提升就讲不清了。
 
+【语义层落地之后（2026-10-09）：口径仍然不进这个文件】
+
+`semantic/metrics.yaml` 里的口径由 `app/semantic/` 渲染成一段文本，
+**作为 user 消息里单独的一块**注入（见 `build_user_prompt`）。
+系统提示一个字没改 —— 这是上面那条纪律的兑现，不是巧合。
+
 【唯一必须写进提示词的，是"别做危险动作"】
 
 不是指望它守规矩（提示词约束是可被绕过的，这点在 README 里已经写明），
@@ -36,14 +42,33 @@ SYSTEM_PROMPT = """你是一个 PostgreSQL 数据分析师。你的任务是把�
 """
 
 
-def build_user_prompt(question: str, schema_card: str) -> str:
-    """把 schema 与问句拼成用户消息。顺序固定，便于对比不同轮次的结果。"""
-    return (
-        "数据库结构：\n"
-        f"{schema_card}\n\n"
-        f"用户问题：{question.strip()}\n\n"
-        "请给出 SQL。"
-    )
+def build_user_prompt(
+    question: str,
+    schema_card: str,
+    *,
+    semantic_block: str = "",
+) -> str:
+    """
+    把 schema、（可选的）业务口径、问句拼成用户消息。顺序固定，便于对比不同轮次的结果。
+
+    【口径为什么放在 schema 之后、问句之前】
+
+    - 放在 schema 之后：模型先看到有哪些字段，口径才好挂到具体字段上
+      （「order_status 的 cancelled 不计入」比空说「取消单不算」更有用）。
+    - 放在问句之前：先给规则、再看题，避免它先按直觉猜一遍再读规则。
+
+    【semantic_block 为空时，输出与历史版本逐字节一致】
+    这不是洁癖：在无语义层的对照档里，输入必须和开语义层之前完全相同，
+    否则比出来的差值里混着"提示词结构变了"的影响，归因就不干净了。
+    """
+    parts = [
+        "数据库结构：\n",
+        f"{schema_card}\n\n",
+    ]
+    if semantic_block:
+        parts.append(f"{semantic_block}\n\n")
+    parts.append(f"用户问题：{question.strip()}\n\n请给出 SQL。")
+    return "".join(parts)
 
 
 def build_messages(
@@ -51,9 +76,20 @@ def build_messages(
     schema_card: str,
     *,
     system_prompt: str = SYSTEM_PROMPT,
+    semantic_block: str = "",
 ) -> list[dict[str, Any]]:
-    """组装成 OpenAI 兼容的 messages 结构。"""
+    """
+    组装成 OpenAI 兼容的 messages 结构。
+
+    ⚠️ `semantic_block` **只进 user 消息，绝不进 system 消息**。
+    系统提示必须保持"只约束形式、一句业务口径都不碰"的状态 ——
+    一旦口径进了系统提示，"加语义层前 vs 后"的对照就废了。
+    这条约束由 `tests/test_semantic.py` 断言守住。
+    """
     return [
         {"role": "system", "content": system_prompt},
-        {"role": "user", "content": build_user_prompt(question, schema_card)},
+        {
+            "role": "user",
+            "content": build_user_prompt(question, schema_card, semantic_block=semantic_block),
+        },
     ]

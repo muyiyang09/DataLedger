@@ -22,6 +22,9 @@ db/pg_boot.log
 eval/reports/
 eval/.cache/
 
+# --- 本机 agent 工作状态（不是项目产物）---
+.workbuddy/
+
 # --- os / editors ---
 .DS_Store
 Thumbs.db

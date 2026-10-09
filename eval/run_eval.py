@@ -49,6 +49,7 @@ from _common import fmt_value, is_time_sensitive, pad, rate_bar, trap_glyph  # n
 from app import db  # noqa: E402
 from app.config import Settings  # noqa: E402
 from app.engines import build_engine  # noqa: E402
+from app.semantic import metric_count as semantic_metric_count  # noqa: E402
 from app.execute.grader import DEFAULT_SET_DECIMALS, grade  # noqa: E402
 from app.execute.result import QueryResult  # noqa: E402
 from app.execute.runner import execute_sql  # noqa: E402
@@ -73,6 +74,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "给模型的 schema 详略（只对 llm 引擎有效）："
             "raw=只有表名列名类型（诚实基线）｜comments=加列注释（剥掉[陷阱N]标记）｜"
             "full=再加行数"
+        ),
+    )
+    parser.add_argument(
+        "--semantic",
+        action="store_true",
+        help=(
+            "开启语义层：把 semantic/metrics.yaml 里的业务口径作为单独一块注入 user 消息"
+            "（只对 llm 引擎有效）。与 --schema-mode 是两个独立变量："
+            "schema 管结构信息，semantic 管业务口径，分开才归因得清。"
         ),
     )
     parser.add_argument("--cases", default=str(PROJECT_ROOT / "eval" / "cases.yaml"))
@@ -156,16 +166,27 @@ def run_case(conn: psycopg.Connection, case: dict, engine, settings: Settings, s
 
     verdict = grade(case, gold_result, model_result, set_decimals=set_decimals)
 
-    # 截断不是"模型答不出来"，是评测把额度给少了 —— 必须和模型能力分开计。
-    # 少了这一条，一轮跑出来的准确率里会混进 harness 自己的缺陷，
-    # 而它看起来和"模型答错"一模一样。
+    # 「这次请求没走通」不是「模型答不出来」—— 必须和模型能力分开计。
+    # 少了这一条，一轮跑出来的准确率里会混进网络抖动和配置缺陷，
+    # 而它们看起来和"模型答错"一模一样。
+    #
+    # 两个来源：
+    #   ① generation.infra_issue —— 生成器标出来的（网络 / HTTP / 截断），
+    #      判断标准只写在 app/engines/__init__.py 的 Generation 里，这里不重复实现；
+    #   ② finish_reason=length —— 冗余兜底，防止将来有人造了个没标 flag 的生成器。
     meta = generation.meta or {}
-    if meta.get("finish_reason") == "length":
+    if generation.infra_issue or meta.get("finish_reason") == "length":
         verdict.harness = True
-        verdict.reason = (
-            f"响应被 max_tokens 截断（completion_tokens={meta.get('completion_tokens')}），"
-            "模型没来得及输出 SQL —— 这是评测配置问题，不是模型能力问题"
-        )
+        if meta.get("finish_reason") == "length":
+            verdict.reason = (
+                f"响应被 max_tokens 截断（completion_tokens={meta.get('completion_tokens')}），"
+                "模型没来得及输出 SQL —— 这是评测配置问题，不是模型能力问题"
+            )
+        else:
+            verdict.reason = (
+                f"请求没有走通：{generation.error} —— 这是网络/服务端问题，"
+                "不是模型能力问题，本用例不计入准确率"
+            )
     return verdict, generation
 
 
@@ -253,6 +274,13 @@ def summarize(verdicts: list, cases: list[dict], engine_name: str, elapsed_s: fl
         "total": total,
         "passed": passed,
         "pass_rate": round(passed / total, 4) if total else 0.0,
+        # 有效分母：框架问题（截断/网络/服务端）不该压低准确率。
+        # 用 total 当分母时，一次代理抖动就能让准确率"变低"，
+        # 而那个数看起来和"模型答错了"没有任何区别。
+        "effective_total": total - len(harness),
+        "pass_rate_effective": (
+            round(passed / (total - len(harness)), 4) if total - len(harness) else 0.0
+        ),
         "exec_ok": exec_ok,
         "exec_rate": round(exec_ok / total, 4) if total else 0.0,
         "harness_issue_count": len(harness),
@@ -301,12 +329,21 @@ def print_summary(summary: dict, verdicts: list) -> None:
         f"SQL 可执行 {summary['exec_ok']}/{total} （{summary['exec_rate'] * 100:.1f}%） ｜ "
         f"耗时 {summary['elapsed_s']:.2f}s"
     )
+    if summary.get("harness_issue_count"):
+        print(
+            f"  ⚠️ 其中 {summary['harness_issue_count']} 条是框架/网络问题（不计入准确率）"
+            f"→ 有效准确率 {summary['passed']}/{summary['effective_total']} "
+            f"（{summary['pass_rate_effective'] * 100:.1f}%）"
+        )
     print("=" * 100)
 
     usage = summary.get("llm_usage")
     if usage:
         print("\n-- 模型用量（成本与延迟指标的来源）--")
-        print(f"  {pad('模型', 18)} {usage['model']}（schema={usage['schema_mode']}）")
+        print(
+            f"  {pad('模型', 18)} {usage['model']}（schema={usage['schema_mode']}，"
+            f"语义层={'开' if summary.get('semantic') else '关'}）"
+        )
         print(f"  {pad('调用次数', 18)} {usage['calls']}")
         print(
             f"  {pad('token 合计', 18)} {usage['total_tokens']:,}"
@@ -386,12 +423,23 @@ def build_markdown(summary: dict, verdicts: list, cases: list[dict], meta: dict)
         f"- **通过率：{summary['passed']}/{summary['total']} "
         f"（{summary['pass_rate'] * 100:.1f}%）**"
     )
+    if summary["harness_issue_count"]:
+        lines.append(
+            f"- **有效通过率（扣除框架/网络问题）：{summary['passed']}/"
+            f"{summary['effective_total']}（{summary['pass_rate_effective'] * 100:.1f}%）**"
+        )
     lines.append(
         f"- **首次可执行率：{summary['exec_ok']}/{summary['total']} "
         f"（{summary['exec_rate'] * 100:.1f}%）**"
     )
     if summary["harness_issue_count"]:
         lines.append(f"- ⚠️ 评测框架问题：{summary['harness_issue_count']} 条（见文末）")
+    if summary.get("semantic"):
+        lines.append(
+            f"- 语义层：**开**（注入 {summary.get('semantic_metric_count', 0)} 条业务口径）"
+        )
+    else:
+        lines.append("- 语义层：**关**（本次不含任何业务口径）")
     lines.append("")
 
     usage = summary.get("llm_usage")
@@ -484,7 +532,12 @@ def main(argv: list[str] | None = None) -> int:
     cases_all = load_cases(cases_path)
     cases = filter_cases(cases_all, args)
     settings = Settings.load()
-    engine = build_engine(args.engine, settings=settings, schema_mode=args.schema_mode)
+    engine = build_engine(
+        args.engine,
+        settings=settings,
+        schema_mode=args.schema_mode,
+        semantic=args.semantic,
+    )
 
     # 引擎就绪自检：配置不全就当场说清。否则会跑出 21 条"SQL 执行失败"的假结果，
     # 看起来像"模型很差"，实际是没配 key —— 这种数字比没有数字更坏。
@@ -526,6 +579,11 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     summary = summarize(verdicts, cases, engine.name, elapsed)
+    # 语义层状态必须进 summary：两份报告放一起时，要能一眼看出哪份开了口径、哪份没开
+    summary["semantic"] = bool(args.semantic)
+    summary["semantic_metric_count"] = (
+        semantic_metric_count() if args.semantic else 0
+    )
     summary["llm_usage"] = collect_llm_usage(generations)
     print_summary(summary, verdicts)
 

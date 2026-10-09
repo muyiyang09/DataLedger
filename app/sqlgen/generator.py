@@ -172,13 +172,18 @@ class SqlGenerator:
             )
         return None
 
-    def generate(self, question: str, schema_card: str) -> Generation:
+    def generate(
+        self, question: str, schema_card: str, *, semantic_block: str = ""
+    ) -> Generation:
         ready = self.check_ready()
         if ready:
             return Generation(error=ready)
 
         messages = build_messages(
-            question, schema_card, system_prompt=self.system_prompt
+            question,
+            schema_card,
+            system_prompt=self.system_prompt,
+            semantic_block=semantic_block,
         )
         payload: dict[str, Any] = {
             "model": self.config.model,
@@ -222,16 +227,23 @@ class SqlGenerator:
             return Generation(
                 error=f"HTTP {exc.code} {hint} {detail}".strip(),
                 meta={"latency_ms": round((time.perf_counter() - started) * 1000, 1)},
+                # HTTP 层返回了错误 —— 无论是 4xx（请求/配置）还是 5xx（服务端），
+                # 都说明"这次请求没走通"，而不是"模型答错了"。所以标成基础设施问题。
+                infra_issue=True,
             )
         except (urllib.error.URLError, socket.timeout, TimeoutError) as exc:
             return Generation(
                 error=f"网络错误：{exc}",
                 meta={"latency_ms": round((time.perf_counter() - started) * 1000, 1)},
+                infra_issue=True,
             )
         except Exception as exc:  # pragma: no cover - 兜底，不能中断整轮评测
+            # 这个兜底裹住的是**传输**调用，所以异常来自网络栈而不是模型输出，
+            # 同样标成基础设施问题（解析阶段的异常不在这里，它会直接抛出去）。
             return Generation(
                 error=f"{type(exc).__name__}: {exc}",
                 meta={"latency_ms": round((time.perf_counter() - started) * 1000, 1)},
+                infra_issue=True,
             )
 
         latency_ms = (time.perf_counter() - started) * 1000
@@ -285,6 +297,7 @@ class SqlGenerator:
                         "—— 推理内容占满了额度，正文没来得及产出"
                     ),
                     meta=meta,
+                    infra_issue=True,
                 )
             return Generation(
                 error=f"模型返回了空内容（finish_reason={finish_reason}）",

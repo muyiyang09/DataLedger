@@ -410,6 +410,25 @@ class TestSqlGenerator(unittest.TestCase):
         generation = make_generator(lambda *a: fake_response("")).generate("问题", "S")
         self.assertFalse(generation.ok)
         self.assertIn("空内容", generation.error)
+        # ★ 成对的另一半：模型**真的**没吐出 SQL，不许标成基础设施问题。
+        # 少了这条断言，infra_issue 就成了一个能给任何失败洗白的字段。
+        self.assertFalse(generation.infra_issue)
+
+    def test_gibberish_content_is_model_failure_not_infra(self):
+        """
+        模型回了一堆和 SQL 无关的话 —— 这是能力问题，必须照实计成失败。
+
+        注意它**不会被这里拦住**：`extract_sql` 找不到 SQL 时会把原文透传出去
+        （见 `test_gibberish_returns_原文`），真正的失败发生在执行阶段
+        —— 原文当 SQL 去执行，数据库报语法错误。这是有意为之：
+        拦在这里等于替模型做判断，而"它到底会不会写 SQL"正是评测要量的东西。
+
+        所以这里要钉住的是：**它没有被标成基础设施问题**，也就是不许走 infra 这条路。
+        """
+        generation = make_generator(
+            lambda *a: fake_response("我不太确定你问的是哪个字段，可以再说明一下吗？")
+        ).generate("问题", "S")
+        self.assertFalse(generation.infra_issue)
 
     def test_truncated_is_not_reported_as_empty_content(self):
         """finish_reason=length 是评测配置问题，不能记成"模型返回了空内容"。
@@ -436,6 +455,7 @@ class TestSqlGenerator(unittest.TestCase):
         self.assertNotIn("空内容", generation.error)
         self.assertEqual(generation.meta["finish_reason"], "length")
         self.assertEqual(generation.meta["completion_tokens"], 1024)
+        self.assertTrue(generation.infra_issue)
 
     def test_no_choices_is_error(self):
         generation = make_generator(lambda *a: {"choices": []}).generate("问题", "S")
@@ -452,6 +472,7 @@ class TestSqlGenerator(unittest.TestCase):
         self.assertFalse(generation.ok)
         self.assertIn("401", generation.error)
         self.assertIn("API key", generation.error)
+        self.assertTrue(generation.infra_issue)
 
     def test_http_404_mentions_model_deprecation(self):
         def transport(*_args):
@@ -468,6 +489,34 @@ class TestSqlGenerator(unittest.TestCase):
         generation = make_generator(transport).generate("问题", "S")
         self.assertFalse(generation.ok)
         self.assertIn("网络", generation.error)
+        self.assertTrue(generation.infra_issue)
+
+    def test_http_502_is_infra_issue(self):
+        """
+        代理 502 —— 2026-10-09 对照实验里真实踩到的（基线一轮 21 条中 5 条）。
+
+        它当时被记成 `harness_issue=False`，也就是**算成了模型答错**：
+        那一轮从有效准确率 37.5% 被拉到 28.6%，差值全部来自代理抖动。
+        """
+
+        def transport(*_args):
+            raise urllib.error.HTTPError("u", 502, "Bad Gateway", {}, None)
+
+        generation = make_generator(transport).generate("问题", "S")
+        self.assertFalse(generation.ok)
+        self.assertTrue(generation.infra_issue)
+
+    def test_ssl_eof_is_infra_issue(self):
+        """SSL 读到一半断了 —— URLError，同样是网络问题。"""
+
+        def transport(*_args):
+            raise urllib.error.URLError(
+                "[SSL: UNEXPECTED_EOF_WHILE_READING] EOF occurred in violation of protocol"
+            )
+
+        generation = make_generator(transport).generate("问题", "S")
+        self.assertFalse(generation.ok)
+        self.assertTrue(generation.infra_issue)
 
     def test_missing_key_never_calls_transport(self):
         calls = []
@@ -497,11 +546,14 @@ class FakeGenerator:
     def __init__(self, sql="SELECT 1", error=None):
         self.sql, self.error = sql, error
         self.seen: list[tuple[str, str]] = []
+        # 记录每次调用收到的口径块 —— 语义层测试靠它断言"口径到底有没有注入、注到哪"
+        self.seen_semantic: list[str] = []
 
-    def generate(self, question, schema_card):
+    def generate(self, question, schema_card, *, semantic_block=""):
         from app.engines import Generation
 
         self.seen.append((question, schema_card))
+        self.seen_semantic.append(semantic_block)
         return Generation(sql=self.sql, error=self.error, meta={"schema_mode": "raw"})
 
     def check_ready(self):
